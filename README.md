@@ -13,12 +13,12 @@ regarding [portable encrypted storage](https://spritely.institute/static/papers/
 ## How It Works
 
 Consider a distributed system where peers exchange and request information.
-They interact with by exchanging [capabilities](https://garbados.github.io/my-blog/conceptual-intro-to-spritely-goblins.html).
+They interact by exchanging [capabilities](https://garbados.github.io/my-blog/conceptual-intro-to-spritely-goblins.html).
 The DSM requires a few capabilities, which have expected parameters and outputs.
 Specifically: the ability to encode content, and the ability to store blocks.
 
 When a user saves content, the *content provider* chunks it into blocks
-and then encrypts them with a *convergence key*. This key is used to affect
+and then encrypts them with a *convergence key*. This key is used to perform
 [convergent encryption](https://en.wikipedia.org/wiki/Convergent_encryption),
 so that the same content with the same key will always encode to the same blocks.
 This encoding process follows the [ERIS](https://eris.codeberg.page/) specification.
@@ -27,12 +27,12 @@ The blocks produced by the content provider
 are then sent to the *storage provider*,
 who persists them somehow.
 Because the content is chunked,
-and each chunk encrypted,
+and each chunk is encrypted,
 the storage provider cannot know what they are storing,
 so they cannot snoop on user content
 even as they hold it.
 
-The encoding process process produces a *read capability*
+The encoding process produces a *read capability*
 (also known as a "readcap")
 which looks like this:
 
@@ -53,10 +53,10 @@ Thus, it should be treated as a sort of password:
 if you have the readcap, you know how to find the content.
 
 When you save content, you are granted a lease on it.
-You can *release* this lease to indicate to tell the
+You can *release* this lease to tell the
 providers of the content's blocks that you no longer
-desire the content be held.
-*This does not guarantee the blocks will be deleted!*
+wish for the content to be held.
+*Releasing content does not guarantee its blocks will be deleted!*
 Because many parties may have leases on content,
 all leases must be released before the content is deleted.
 However, it's important to note that
@@ -70,8 +70,8 @@ the collective availability of an arbitrary *mesh* of block providers.
 Consider a *proxy block provider* which syndicates reads and writes
 to other block providers.
 This proxy block provider can distribute read requests across providers
-and then return the first that returns (or the second that agrees, etc);
-it can distribute writes across providers too,
+and then return the first that responds (or the second that agrees, etc).
+It can distribute writes across providers too,
 considering a write a "success" even if some providers failed to save.
 This provides significant redundancy and parallelism,
 while protecting users and storage providers alike.
@@ -83,8 +83,8 @@ You can build the project from source with [guix](https://guix.gnu.org/):
 ``` shell
 $ git clone https://github.com/garbados/distributed-storage-mesh.git
 $ cd distributed-storage-mesh
-# see a demo of what's possible
-$ guix shell -m manifest.scm -- guile demo.scm
+# run the test suite
+$ guix shell -m manifest.scm -- guile -l dsm.scm tests.scm
 ```
 
 You can also load the library to require in other files:
@@ -96,12 +96,23 @@ $ guile -l dsm.scm your-file.scm
 Then you can use the library and its functions:
 
 ``` scheme
-(use-modules ((dsm)
-              #:select (spawn-block-provider
-                        spawn-proxy-block-provider
-                        spawn-sqlite-block-provider
-                        spawn-memory-block-provider
-                        ^content-provider)))
+(use-modules ((goblins)
+              #:select (spawn-vat define-vat-run $))
+             ((dsm)
+              #:select (spawn-sqlite-block-provider
+                        spawn-sync-content-provider)))
+
+(define a-vat (spawn-vat))
+(define-vat-run a-run a-vat)
+
+(define-values
+  (block-provider revoked?)
+  (a-run (spawn-sqlite-block-provider "dsm.db")))
+(define content-provider
+  (a-run (spawn-sync-content-provider block-provider)))
+
+(pk (a-run ($ content-provider 'save-content "hello world")))
+;;> (list readcap release)
 ```
 
 ## Usage
@@ -120,8 +131,9 @@ Given these functions, the following values are returned:
 
 - `block-provider`: a [Goblins](https://gitlab.com/spritely/guile-goblins/-/blob/main/doc/goblins.org) object
   with two methods:
-  - `(<- block-provider 'read-block ref)`: Returns a block by ref.
-  - `(<- block-provider 'save-block ref block)`: Persists a block
+  - `($/<- block-provider 'read-block ref)`: Returns a block by ref
+    using the supplied `read-block` function.
+  - `($/<- block-provider 'save-block ref block)`: Persists a block
     with the supplied `save-block` function.
 - `revoked?`: a "cell" that can be flipped to a truthy value
   to disable the block provider. While the cell is truthy,
@@ -129,25 +141,27 @@ Given these functions, the following values are returned:
 
 ### spawn-proxy-block-provider
 
-Parameters:
-- `add-provider` - `(add-provider sturdyref)`: TODO
-- `remove-provider` - `(remove-provider sturdyref)`: TODO
-- `map-providers` - `(map-providers (lambda (sturdyref) ...)`: TODO
-- `providers`: a list of sturdyrefs to begin with. Defaults to an empty list.
-
-Returns the same values as `spawn-block-provider`.
+TODO not yet implemented
 
 ### spawn-sqlite-block-provider
 
-TODO
+TODO implemented, undocumented
 
 ### spawn-memory-block-provider
 
-TODO
+TODO implemented, undocumented
 
 ### ^content-provider
 
-TODO
+TODO implemented, undocumented
+
+### spawn-async-content-provider
+
+TODO implemented, undocumented
+
+### spawn-sync-content-provider
+
+TODO implemented, undocumented
 
 ## Tests
 
