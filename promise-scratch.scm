@@ -86,8 +86,11 @@
 (define (process-results results) results)
 (define content-provider (b-run (spawn-async-content-provider block-provider)))
 
-;; this hangs forever
-(pk 'content (b-run ($ content-provider 'save-content "hello world")))
+;; this WORKS
+(define readcap (car (b-run ($ content-provider 'save-content "hello world"))))
+(pk 'readcap readcap)
+(define content (b-run ($ content-provider 'read-content readcap)))
+(pk 'content content)
 
 ;; maybe i need to change some fundamental assumptions...
 

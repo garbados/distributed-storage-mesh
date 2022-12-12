@@ -36,7 +36,8 @@
                           %gcry-very-strong-random))
   #:use-module ((eris)
                 #:select (eris-encode
-                          eris-decode))
+                          eris-decode
+                          %null-convergence-secret))
   #:use-module ((sqlite3)
                 #:select (sqlite-open
                           sqlite-bind
@@ -55,56 +56,12 @@
 
 (define (random-secret) (gen-random-bv 32 %gcry-very-strong-random))
 
-;; (goblins actor-lib joiners) doesn't export code, for some reason
-;; so we do it ourselves
-
-(use-modules ((goblins)
-              #:select (<-np
-                        spawn-promise-values)))
-
-(define (all-of* promises)
-  (define-cell waiting
-    promises)
-  (define-cell results
-    '())
-  (define-cell broken?
-    #f)
-
-  (define-values (join-promise join-resolver)
-    (spawn-promise-values))
-
-  (define (results->list results-alist)
-    (map
-     (lambda (promise)
-       (cdr (assq promise results-alist)))
-     promises))
-
-  (define (resolve-promise promise)
-    (on promise
-        (lambda (result)
-          (unless ($ broken?)
-            (let ((new-results (acons promise result ($ results)))
-                  (new-waiting (delq promise ($ waiting))))
-              (if (null? new-waiting)
-                  (<-np join-resolver 'fulfill
-                        (results->list new-results))
-                  (begin ($ waiting new-waiting)
-                         ($ results new-results))))))
-        #:catch
-        (lambda (err)
-          (unless ($ broken?)
-            ($ broken? #t)
-            (<-np join-resolver 'break err)))))
-
-  (map resolve-promise promises)
-  join-promise)
-
 ;; return synchronously using a callback
 
 (define (cbify proc)
   (define return-channel (make-channel))
-  (define-vat-run run (spawn-vat))
   (pk 'cbify-begin return-channel)
+  (define-vat-run run (spawn-vat))
   (run (pk 'cbify-inner)
        (on (proc)
            (lambda (. args)
@@ -129,68 +86,61 @@
                                read-block
                                delete-block
                                create-lease
-                               count-leases
-                               #:optional
-                               close)
+                               count-leases)
   (define (make-lease ref)
     (define release (create-lease ref))
-    (define-cell released?)
+    (define released? #f)
     (lambda ()
-      (unless ($ released?)
+      (unless released?
         (release)
-        ($ released? #t))
+        (set! released? #t))
       (when (eq? 0 (count-leases ref))
         (delete-block ref))))
-  (define-cell revoked? #f)
   (define (^block-provider _bcom)
     (methods
      ((save-block ref block)
-      (when ($ revoked?) (error 'revoked))
       (save-block ref block)
       (make-lease ref))
      ((read-block ref)
-      (when ($ revoked?) (error 'revoked))
-      (read-block ref))
-     ((close)
-      (when close (close)))))
-  (values
-   (spawn ^block-provider)
-   revoked?))
+      (read-block ref))))
+  (spawn ^block-provider))
 
 ;; CONTENT PROVIDERS
 
-(define (^content-provider _bcom save-block read-block process-results)
+(define (^content-provider _bcom save-block read-block)
+  (define (my-save-content content key block-size)
+    (define final-releases '())
+    (define reducer
+      (case-lambda
+        (() '())
+        ((releases)
+         (set! final-releases releases))
+        ((releases ref-block)
+         (define ref (car ref-block))
+         (define block (cdr ref-block))
+         (define release (save-block ref block))
+         (cons release releases))))
+    (define (release-content)
+      (unless (null? final-releases)
+        ;; run each block release
+        (for-each (lambda (release) (release)) final-releases)
+        ;; clear the releases cell so this becomes a noop
+        (set! final-release '())))
+    (define readcap (eris-encode (syrup-encode content)
+                                 #:block-size block-size
+                                 #:block-reducer reducer
+                                 #:convergence-secret key))
+    `(,readcap ,release-content))
   (methods
    ((save-content content
                   #:optional
                   (key (random-secret))
                   (block-size 'small))
-    (define-cell release-cell)
-    (define reducer
-      (case-lambda
-        (() '())
-        ((results)
-         (define releases (process-results results))
-         ($ release-cell releases))
-        ((results ref-block)
-         (define ref (car ref-block))
-         (define block (cdr ref-block))
-         (define result (save-block ref block))
-         (cons result results))))
-    (define (release-content)
-      (define releases ($ release-cell))
-      (unless (null? releases)
-        ;; run each block release
-        (for-each (lambda (release) (release)) releases)
-        ;; clear the releases cell so this becomes a noop
-        ($ release-cell '())))
-    (define readcap (eris-encode (syrup-encode content)
-                                 #:block-size block-size
-                                 #:block-reducer reducer
-                                 #:convergence-secret key))
-    (list
-     readcap
-     release-content))
+    (my-save-content content key block-size))
+   ((save-content-public content
+                         #:optional
+                         (block-size 'small))
+    (my-save-content content %null-convergence-secret block-size))
    ((read-content readcap)
     (syrup-decode (eris-decode readcap
                                #:block-ref read-block)))))
@@ -207,9 +157,7 @@
         (cbify (lambda ()
                  (pk 'async-read ref)
                  (<- block-provider 'read-block ref)))))
-  (define (process-results results)
-    results)
-  (spawn ^content-provider save-block read-block process-results))
+  (spawn ^content-provider save-block read-block))
 
 ;; for when your block provider is on your machine
 (define (spawn-sync-content-provider block-provider)
@@ -217,9 +165,7 @@
     ($ block-provider 'save-block ref block))
   (define (read-block ref)
     ($ block-provider 'read-block ref))
-  (define (process-results results)
-    results)
-  (spawn ^content-provider save-block read-block process-results))
+  (spawn ^content-provider save-block read-block))
 
 ;; HASHMAP (in-memory) BACKEND FOR BLOCK STORAGE
 
@@ -304,9 +250,7 @@
       (sqlite-bind stmt 1 ref)
       (let ((result (db-exec stmt)))
         (vector-ref (car result) 0))))
-  (define (close)
-    (sqlite-close db))
-  (values save-block read-block delete-block create-lease count-leases close))
+  (values save-block read-block delete-block create-lease count-leases))
 
 (define* (spawn-sqlite-block-provider db-path #:optional clear?)
   (call-with-values (lambda () (init-sqlite-ops db-path clear?))
