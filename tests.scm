@@ -3,58 +3,58 @@
 (use-modules ((goblins)
               #:select (spawn-vat
                         define-vat-run
-                        $))
+                        $
+                        <-))
              ((dsm)
-              #:select (spawn-memory-block-provider
+              #:select (spawn-block-provider
+                        ;spawn-proxy-block-provider
+                        spawn-memory-block-provider
                         spawn-sqlite-block-provider
                         spawn-async-content-provider
-                        spawn-sync-content-provider)))
+                        spawn-sync-content-provider
+                        cbify))
+             ((srfi srfi-64)
+              #:select (test-group-with-cleanup
+                        test-group
+                        test-assert)))
 
-(define content "hello world")
+(define-syntax await
+  (syntax-rules ()
+    [(_ vat . exprs)
+     (cbify vat (lambda () exprs))]))
 
 ;; goblin vats -- event loops on a run (like a virtual machine)
 (define a-vat (spawn-vat))
-(define-vat-run a-run a-vat)
 (define b-vat (spawn-vat))
+(define-vat-run a-run a-vat)
 (define-vat-run b-run b-vat)
 
-(define backends
-  (list
-   (list "memory" spawn-memory-block-provider)
-   (list "sqlite" (lambda ()
-                    (spawn-sqlite-block-provider "scratch.db" #t)))))
+(define (random-string)
+  (define len (random 10000000))
+  (define max-char 55296)
+  (define (random-char) (integer->char (random max-char)))
+  (define (gen-chars chars len)
+    (if (eq? len 0)
+        chars
+        (cons (random-char) chars)))
+  (pk 'content-length len)
+  (list->string (gen-chars '() len)))
 
-;; content-provider save-then-read test
-(define (content-test test-name content-provider)
-  (define save-result ($ content-provider 'save-content content))
-  (define readcap (car save-result))
-  (define result ($ content-provider 'read-content readcap))
-  (pk 'test test-name 'result result 'pass (string=? content result)))
+(define block-provider (a-run (spawn-memory-block-provider)))
+(define content-provider
+  (b-run (spawn-async-content-provider b-vat block-provider)))
+(define (test-content vat content)
+  (define readcap
+    (cbify b-vat (lambda () (<- content-provider 'save-content content))))
+  (define result
+    (cbify b-vat (lambda () (<- content-provider 'read-content readcap))))
+  (pk 'test-content content 'pass (eq? content result)))
 
-(define (sync-tests)
-  (for-each
-   (lambda (args)
-     (define backend (car args))
-     (define block-provider-spawner (car (cdr args)))
-     (define block-provider (a-run (block-provider-spawner)))
-     (define test-name (string-append backend "-sync"))
-     (define content-provider
-       (a-run (spawn-sync-content-provider block-provider)))
-     (a-run (content-test test-name content-provider)))
-   backends))
+(define (run-tests proc i n)
+  (unless (eq? i n)
+    (pk 'test (1+ i))
+    (proc)
+    (run-tests proc (1- i) n)
+    ))
 
-(define (async-tests)
-  (for-each
-   (lambda (args)
-     (define backend (car args))
-     (define block-provider-spawner (car (cdr args)))
-     (define block-provider (a-run (block-provider-spawner)))
-     (define test-name (string-append backend "-async"))
-     (define content-provider
-       (b-run (spawn-async-content-provider block-provider)))
-     (b-run (content-test test-name content-provider)))
-   backends))
-
-(for-each
- (lambda (tests) (tests))
- (list sync-tests #|async-tests|#))
+(run-tests (lambda () (test-content b-vat (random-string)))0 5)

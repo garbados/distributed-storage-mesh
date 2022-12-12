@@ -7,7 +7,8 @@
             spawn-memory-block-provider
             ^content-provider
             spawn-async-content-provider
-            spawn-sync-content-provider)
+            spawn-sync-content-provider
+            cbify)
   #:use-module ((goblins)
                 #:select (spawn
                           spawn-vat
@@ -44,7 +45,10 @@
                           sqlite-exec
                           sqlite-map
                           sqlite-prepare
-                          sqlite-finalize)))
+                          sqlite-finalize
+                          sqlite-close))
+  #:use-module ((fibers channels)
+                #:select (make-channel get-message put-message)))
 
 ;; chunking requires a convergence secret.
 ;; by default we'll use a strong random.
@@ -97,18 +101,37 @@
 
 ;; return synchronously using a callback
 
-(define (cbify vow)
-  (call-with-prompt 'cbify
-    (lambda () (abort-to-prompt 'cbify))
-    (lambda (cb) (on vow cb))))
+(define (cbify proc)
+  (define return-channel (make-channel))
+  (define-vat-run run (spawn-vat))
+  (pk 'cbify-begin return-channel)
+  (run (pk 'cbify-inner)
+       (on (proc)
+           (lambda (. args)
+             (pk 'cbify-args args)
+             (put-message return-channel (list 'ok args))
+             'done)
+           #:catch
+           (lambda (err)
+             (put-message return-channel (list 'err err))
+             'err)))
+  (define result (get-message return-channel))
+  (pk 'cbify-result result)
+  (define status (car result))
+  (define args (car (cdr result)))
+  (if (eq? status 'ok)
+      (apply values (car args) (cdr args))
+      (error value)))
 
 ;; BLOCK PROVIDER
 
-(define (spawn-block-provider save-block
-                              read-block
-                              delete-block
-                              create-lease
-                              count-leases)
+(define* (spawn-block-provider save-block
+                               read-block
+                               delete-block
+                               create-lease
+                               count-leases
+                               #:optional
+                               close)
   (define (make-lease ref)
     (define release (create-lease ref))
     (define-cell released?)
@@ -127,7 +150,9 @@
       (make-lease ref))
      ((read-block ref)
       (when ($ revoked?) (error 'revoked))
-      (read-block ref))))
+      (read-block ref))
+     ((close)
+      (when close (close)))))
   (values
    (spawn ^block-provider)
    revoked?))
@@ -173,11 +198,17 @@
 ;; for when your block provider is on another machine
 (define (spawn-async-content-provider block-provider)
   (define (save-block ref block)
-    (<- block-provider 'save-block ref block))
+    (pk 'async-save-result
+        (cbify (lambda ()
+                 (pk 'async-save ref)
+                 (<- block-provider 'save-block ref block)))))
   (define (read-block ref)
-    (cbify (<- block-provider 'read-block ref)))
+    (pk 'async-read-result
+        (cbify (lambda ()
+                 (pk 'async-read ref)
+                 (<- block-provider 'read-block ref)))))
   (define (process-results results)
-    (cbify (all-of* results)))
+    results)
   (spawn ^content-provider save-block read-block process-results))
 
 ;; for when your block provider is on your machine
@@ -234,12 +265,14 @@
                      "block blob not null"))
 
 (define (init-sqlite-ops db-name clear?)
+  (define init? (file-exists? db-name))
   (define db (init-db db-name))
   (when clear?
     (clear-table db "leases")
     (clear-table db "blocks"))
-  (init-simple-table db "leases" lease-defs)
-  (init-simple-table db "blocks" block-defs)
+  (when (or clear? init?)
+    (init-simple-table db "leases" lease-defs)
+    (init-simple-table db "blocks" block-defs))
   (define (save-block ref block)
     (let* ((query "insert into blocks values (?,?);")
            (stmt (sqlite-prepare db query)))
@@ -271,7 +304,9 @@
       (sqlite-bind stmt 1 ref)
       (let ((result (db-exec stmt)))
         (vector-ref (car result) 0))))
-  (values save-block read-block delete-block create-lease count-leases))
+  (define (close)
+    (sqlite-close db))
+  (values save-block read-block delete-block create-lease count-leases close))
 
 (define* (spawn-sqlite-block-provider db-path #:optional clear?)
   (call-with-values (lambda () (init-sqlite-ops db-path clear?))
@@ -279,23 +314,90 @@
 
 ;; PROXY BLOCK PROVIDER
 
-(define* (spawn-proxy-block-provider add-provider
+#|(define* (spawn-proxy-block-provider vat
+                                     add-provider
                                      remove-provider
                                      map-providers
                                      #:optional
                                      (read-n 3)
                                      (save-n 3))
-  (define providers (make-hash-map))
-  (map-providers (lambda (sturdyref provider)
-                   (hash-set! providers sturdyref provider)))
-  (methods
-   ((read-block ref)
-    'TODO)
-   ((save-block ref block)
-    'TODO)
-   ((add-provider sturdyref)
-    'TODO)
-   ((remove-provider sturdyref)
-    'TODO)
-   ((map-providers fn)
-    'TODO)))
+  (define providers (make-hash-table))
+  ;; internal methods for managing providers
+  (define (count-providers)
+    (hash-fold (lambda (_ __ i) (+ 1 i)) 0 providers))
+  (define (list-providers)
+    (hash-map->list (lambda (_ provider) provider) providers))
+  ;; init providers using given mapper
+  (map-providers (lambda (ref provider)
+                   (hash-set! providers ref provider)))
+  (define-cell revoked?)
+  (define (^proxy-block-provider _bcom)
+    (methods
+     ((read-block ref)
+      (when ($ revoked?) (error 'revoked))
+      ;; setup vars
+      (define providers-count (count-providers))
+      (define n (if (> read-n providers-count)
+                    read-n
+                    providers-count))
+      (define-cell queue (list-providers))
+      ;; collate results and errors
+      (define-cell errors '())
+      (define-cell results '())
+      ;; error handler
+      (define (handle-err err)
+        ($ errors (cons err ($ errors)))
+        (maybe-spawn-read))
+      ;; each read runs in a separate promise
+      (define (spawn-read provider)
+        (define result
+          (cbify vat (lambda () (<- provider 'read-block ref))
+                 handle-err))
+        (when result
+          ($ results (cons result ($ results)))))
+      (define (maybe-spawn-read)
+        (define provider (car ($ queue)))
+        ;; fizzle if we already have a result
+        (when (null? ($ results))
+          ;; since we know we'll use this provider, dequeue it
+          ($ queue (cdr ($ queue)))
+          (spawn-read provider)))
+      ;; spawn reads from the queue up to `n'
+      (for-each (lambda (_) (maybe-spawn-read)) (make-list n))
+      ;; finally...
+      (define final-results ($ results))
+      (if (null? final-results)
+          (error 'failed ($ errors))
+          final-results))
+     ((save-block ref block)
+      (when ($ revoked?) (error 'revoked))
+      (define-cell errors '())
+      (define-cell results '())
+      (define (handle-err err)
+        ($ errors (cons err ($ errors)))
+        #f)
+      (define (spawn-write provider)
+        (define result
+          (cbify (<- provider 'save-block ref block)
+                 handle-err))
+        (when result
+          ($ results (cons result ($ results)))))
+      (map spawn-write (list-providers))
+      ;; collate return values
+      (define releases ($ results))
+      (if (< save-n (length releases))
+          (error 'failed ($ errors))
+          (lambda ()
+            ;; combine release functions
+            (for-each (lambda (release) (release)) releases)
+            )))
+     ((add-provider ref provider)
+      (hash-set! providers ref provider)
+      (add-provider ref))
+     ((remove-provider ref)
+      (remove-provider ref))
+     ((map-providers fn)
+      (map-providers fn))))
+  (values
+   (spawn ^proxy-block-provider)
+   revoked?))|#

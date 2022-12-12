@@ -119,18 +119,28 @@ Then you can use the library and its functions:
 
 ### spawn-block-provider
 
+Given methods for interacting with a persistence layer, returns a block provider
+and a cell that can be used to revoke access to the provider.
+
 Parameters:
+- `save-block` - `(save-block ref block)`: given a reference to a block
+  and the block itself, return a `release` function which clears the
+  lease on the block. When all leases have been cleared, the block
+  is deleted.
 - `read-block` - `(read-block ref)`: given a reference to a block, returns that block.
   The reference and block are both bytevectors.
-- `save-block` - `(save-block ref block)`: TODO
-- `delete-block` - `(delete-block ref block)`: TODO
-- `create-lease` - `TODO`: TODO
-- `count-leases` - `TODO`: TODO
+- `delete-block` - `(delete-block ref)`: given a reference to a block,
+  remove the block from storage.
+- `create-lease` - `(create-lease ref)`: given a reference to a block, return a
+  `release` function. As an example, this function might increment a ref counter
+  and return a function that decrements it. The `release` function will only
+  be run once if ever.
+- `count-leases` - `(count-leases ref)`: given a reference to a block, return
+  the number of open leases as an integer.
 
 Given these functions, the following values are returned:
 
-- `block-provider`: a [Goblins](https://gitlab.com/spritely/guile-goblins/-/blob/main/doc/goblins.org) object
-  with two methods:
+- `block-provider`: a Goblins object with two methods:
   - `($/<- block-provider 'read-block ref)`: Returns a block by ref
     using the supplied `read-block` function.
   - `($/<- block-provider 'save-block ref block)`: Persists a block
@@ -138,6 +148,9 @@ Given these functions, the following values are returned:
 - `revoked?`: a "cell" that can be flipped to a truthy value
   to disable the block provider. While the cell is truthy,
   the block provider's methods will throw `(error 'revoked)`.
+  - to flip the cell: `($/<- revoked? #t)`
+
+*(`$/<-` refers to the `$` and `<-` operators, which run an object method)*
 
 ### spawn-proxy-block-provider
 
@@ -145,23 +158,93 @@ TODO not yet implemented
 
 ### spawn-sqlite-block-provider
 
-TODO implemented, undocumented
+Creates a block provider backed by a SQLite database.
+
+Parameters:
+- `db-path`: The path to the file that will be used as a SQLite database,
+  as a string.
+- (optional: `clear?`: a boolean that defaults to false. When truthy,
+  the file at `db-path` will be wiped and the necessary tables reinitialized)
+
+Returns the same values as `spawn-block-provider`.
 
 ### spawn-memory-block-provider
 
-TODO implemented, undocumented
+Creates a block provider backed by in-memory hash tables
+made with `make-hash-table`.
+
+No parameters. Returns the same values as `spawn-block-provider`.
 
 ### ^content-provider
 
-TODO implemented, undocumented
+Given methods for persisting blocks, return a content provider.
+
+Usually these methods are provided through a block provider,
+such as with `spawn-async-content-provider`
+and `spawn-sync-content-provider`.
+Thus this is intended as raw access --
+the ability to implement a content provider
+without a block provider.
+
+As it is a Goblins object, it must be invoked with `spawn`:
+
+``` scheme
+(spawn ^content-provider save-block read-block process-results)
+```
+
+Parameters:
+- `save-block` - `(save-block ref block)`: given a reference to a block
+  and the block itself.
+  This is done for each block produced by the encoding;
+  the results of all these saves are sent to `process-results`.
+- `read-block` - `(read-block ref)`: given a reference to a block, returns that block.
+  The reference and block are both bytevectors.
+- `process-results` - `(process-results results)`: given a list of the results
+  of saving each block produced while encoding some content, return a list of
+  `release` functions. These functions are then bundled into the `release`
+  function given to the caller once `save-content` returns.
+
+Returns a Goblins object with the following methods:
+
+- `($/<- content-provider 'save-content content #:optional key block-size)`:
+  - Given content to save, chunk it into blocks and persist them.
+  - Optionally, a convergence key can be provided as a 32-byte vector.
+    By default, a vector of random bytes is used.
+  - A block size can also be specified,
+    as either the symbol `'small` or `'large`.
+    `'small` produces 1KiB (1024 bytes) blocks,
+    `'large` produces 32KiB (32768 bytes) blocks.
+    This defaults to `'small`,
+    but you should set it to `'large` if you expect content to be
+    larger than 16KiB.
+
+*(`$/<-` refers to the `$` and `<-` operators, which run an object method)*
 
 ### spawn-async-content-provider
 
-TODO implemented, undocumented
+Given a block provider, returns a content provider:
+
+``` scheme
+(spawn-async-content-provider block-provider)
+```
+
+The block provider is expected to be running on a different machine (or "vat")
+than the content provider.
+
+Returns the same value as `(spawn ^content-provider ...)`.
 
 ### spawn-sync-content-provider
 
-TODO implemented, undocumented
+Given a block provider, returns a content provider:
+
+``` scheme
+(spawn-sync-content-provider block-provider)
+```
+
+The block provider is expected to be running on the same machine (or "vat")
+as the content provider.
+
+Returns the same value as `(spawn ^content-provider ...)`.
 
 ## Tests
 
