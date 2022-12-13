@@ -6,28 +6,38 @@
                         define-vat-run
                         $
                         <-))
+             ((goblins actor-lib methods)
+              #:select (methods))
              ((dsm)
-              #:select (spawn-block-provider
-                        ;spawn-proxy-block-provider
-                        spawn-memory-block-provider
-                        spawn-sqlite-block-provider
-                        spawn-async-content-provider
-                        spawn-sync-content-provider
-                        cbify))
+              #:select (^encoder
+                        ^decoder
+                        ^block-writer
+                        ^block-reader
+                        ^content-writer
+                        ^content-reader
+                        ^proxy-block-writer
+                        ^proxy-block-reader))
+             ((dsm utils)
+              #:select (await))
              ((srfi srfi-64)
               #:select (test-end
                         test-begin
+                        test-error
                         test-assert)))
 
-;;(define-syntax await
-;;  (syntax-rules ()
-;;    [(_ vat . exprs)
-;;     (cbify vat (lambda () exprs))]))
+;; test-group doesn't seem to work as advertised
+(define-syntax test-group
+  (syntax-rules ()
+    ((_ suite-name exp ...)
+     (begin
+       (test-begin suite-name)
+       (begin exp ...)
+       (test-end suite-name)))))
 
 ;; goblin vats (like a thread)
 (define a-vat (spawn-vat))
 (define b-vat (spawn-vat))
-;; vat runs -- macro like (vat (lambda () exprs ...))
+;; vat runs -- macro expands to (vat (lambda () exprs ...))
 (define-vat-run a-run a-vat)
 (define-vat-run b-run b-vat)
 
@@ -39,73 +49,97 @@
   (list->string
    (map (lambda (_) (random-char)) (make-list len))))
 
-;; our handy dandy block provider. in-memory only
-(define block-provider (a-run (spawn-memory-block-provider)))
+(test-group "logs/encoder_decoder_model_works"
+  (for-each
+   (lambda (_)
+     (define blocks (make-hash-table))
+     (define (save-block ref block) (hash-set! blocks ref block))
+     (define (read-block ref) (hash-ref blocks ref))
+     (define encode (a-run (spawn ^encoder save-block)))
+     (define decode (b-run (spawn ^decoder read-block)))
+     (define content (random-string))
+     (define readcap (a-run ($ encode content)))
+     (define result (a-run (await (<- decode readcap))))
+     (test-assert "content == result" (string=? content result)))
+   (make-list 100)))
 
-(test-begin "sync content provider test")
-(test-begin "sync content provider can read its own writes")
-(define sync-content-provider
-  (a-run (spawn-sync-content-provider block-provider)))
-(for-each
- (lambda (_)
-   (define content (random-string))
-   (define readcap
-     (car (a-run ($ sync-content-provider 'save-content content))))
-   (define result
-     (a-run ($ sync-content-provider 'read-content readcap)))
-   (test-assert "content == result" (string=? content result)))
- (make-list 100))
-(test-end)
-(test-begin "sync content provider produces stable URNs")
-(begin
+(test-group "logs/block_content_provider_works"
   (define content (random-string))
-  (define readcap1
-    (car (a-run ($ sync-content-provider 'save-content-public content))))
-  (define readcap2
-    (car (a-run ($ sync-content-provider 'save-content-public content))))
-  (test-assert "readcap1 == readcap2" (string=? readcap1 readcap2)))
-(test-end)
-(test-end)
+  (define (^memory-block-provider _bcom)
+    (define blocks (make-hash-table))
+    (methods
+     ((save-block ref block)
+      (hash-set! blocks ref block))
+     ((read-block ref)
+      (hash-ref blocks ref))))
+  (define (^content-provider _bcom save-block read-block)
+    (define encode (spawn ^encoder save-block))
+    (define decode (spawn ^decoder read-block))
+    (methods
+     ((save-content content)
+      ($ encode content))
+     ((read-content readcap)
+      ($ decode readcap))))
+  (define block-provider (a-run (spawn ^memory-block-provider)))
+  (define content-provider
+    (b-run
+     (spawn ^content-provider
+            (lambda (ref block)
+              (await (<- block-provider 'save-block ref block)))
+            (lambda (ref)
+              (await (<- block-provider 'read-block ref))))))
+  (define readcap (b-run ($ content-provider 'save-content content)))
+  (test-assert "content == result" (string=? content result)))
 
-(test-begin "isolated proof of async error")
-(use-modules ((eris)
-              #:select (eris-encode eris-decode %null-convergence-secret))
-             ((goblins contrib syrup)
-              #:select (syrup-encode syrup-decode)))
-(begin
+(test-group "logs/remote-save-read-works"
   (define blocks (make-hash-table))
-  (define (save-block ref block) (hash-set! blocks ref block))
-  (define (read-block ref) (hash-ref blocks ref))
-  (define (^encoder _bcom)
-    (define reducer
-      (case-lambda
-        (() '())
-        ((_) 'done)
-        ((_ ref-block)
-         (save-block (car ref-block) (cdr ref-block)))))
-    (lambda (content)
-      (eris-encode (syrup-encode content)
-                   #:block-size 'small
-                   #:block-reducer reducer
-                   #:convergence-secret %null-convergence-secret)))
-  (define (^decoder _bcom)
-    (lambda (readcap)
-      (syrup-decode (eris-decode readcap
-                                 #:block-ref read-block))))
-  (define encode (a-run (spawn ^encoder)))
-  (define decode (b-run (spawn ^decoder)))
-  (define content "hello world")
-  (define readcap (pk (a-run ($ encode content))))
-  (define result (pk (b-run ($ decode readcap))))
-  (test-assert "content == result" (string=? content result))
-  )
-(test-end "isolated proof of async error")
+  (define (^save-block _bcom)
+    (lambda (ref block) (hash-set! blocks ref block)))
+  (define (^read-block _bcom)
+    (lambda (ref) (hash-ref blocks ref)))
+  (define save-block (a-run (spawn ^save-block)))
+  (define read-block (a-run (spawn ^read-block)))
+  (define encode (b-run (spawn ^encoder
+                               (lambda (ref block)
+                                 (await (<- save-block ref block))))))
+  (define decode (b-run (spawn ^decoder
+                               (lambda (ref)
+                                 (await (<- read-block ref))))))
+  (define content (random-string))
+  (define readcap (b-run ($ encode content)))
+  (define result (b-run ($ decode readcap)))
+  (test-assert "content == result" (string=? content result)))
 
-(test-begin "async content provider test")
-(define async-content-provider
-  (b-run (spawn-async-content-provider block-provider)))
-(define content (random-string))
-(define readcap (car (b-run ($ async-content-provider 'save-content content))))
-(define result (b-run ($ async-content-provider 'read-content readcap)))
-(test-assert ("content == result" (string=? content result)))
-(test-end "async content provider test")
+(test-group "logs/proxy-content-tests"
+  (define (^bad-block-actor _bcom)
+    (lambda (_ __) (error 'fail)))
+  (define blocks (make-hash-table))
+  (define (write-block ref block) (hash-set! blocks ref block))
+  (define (read-block ref) (hash-ref blocks ref))
+  (define block-writer1 (a-run (spawn ^block-writer write-block)))
+  (define block-writer2 (a-run (spawn ^block-writer write-block)))
+  (define block-writer3 (a-run (spawn ^block-writer write-block)))
+  (define block-writer4 (a-run (spawn ^bad-block-actor)))
+  (define block-writers (list block-writer1
+                              block-writer2
+                              block-writer3
+                              block-writer4
+                              ))
+  (define block-reader1 (a-run (spawn ^block-reader read-block)))
+  (define block-reader2 (a-run (spawn ^block-reader read-block)))
+  (define block-reader3 (a-run (spawn ^block-reader read-block)))
+  (define block-reader4 (a-run (spawn ^bad-block-actor)))
+  (define block-readers (list block-reader1
+                              block-reader2
+                              block-reader3
+                              block-reader4
+                              ))
+  (define proxy-read-block (b-run (spawn ^proxy-block-reader block-readers)))
+  (define proxy-write-block (b-run (spawn ^proxy-block-writer block-writers)))
+  (define-vat-run c-run (spawn-vat))
+  (define write-content (c-run (spawn ^content-writer proxy-write-block)))
+  (define read-content (c-run (spawn ^content-reader proxy-read-block)))
+  (define content (random-string))
+  (define readcap (c-run ($ write-content content)))
+  (define result (c-run ($ read-content content)))
+  (test-assert "content == result" (string=? content result)))
