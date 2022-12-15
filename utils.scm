@@ -11,9 +11,9 @@
   #:use-module ((fibers channels)
                 #:select (make-channel get-message put-message)))
 
-(define (cbify proc)
+(define* (cbify proc #:optional (vat (spawn-vat)))
   (define return-channel (make-channel))
-  (define-vat-run run (spawn-vat))
+  (define-vat-run run vat)
   (run (on (proc)
            (lambda (. args)
              (put-message return-channel (list 'ok args))
@@ -57,15 +57,23 @@
   (for-each <<- promises)
   (values ($ results) ($ errors)))
 
-;; return the first result (or all failures)
-(define (await-one vows)
+;; receives and checks for agreement between the first n results
+(define (await-n vows n)
   (define-values (promises results errors) (await* vows))
+  (define i 0)
   (for-each
    (lambda (promise)
-     (unless (null? ($ result))
-       (<<- promise)))
+     (when (< i n)
+       (<<- promise)
+       (set! i (1+ i))))
    promises)
-  (define final-result ($ result))
-  (if (null? final-result)
-      (error 'failed ($ errors))
-      (car final-result)))
+  (define final-result
+    (fold
+     (lambda (result last-result)
+       (if (eq? result last-result)
+           result
+           (error 'conflict)))
+     ($ results)))
+  (if final-result
+      final-result
+      (error 'failed ($ errors))))
