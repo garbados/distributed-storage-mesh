@@ -15,20 +15,35 @@ regarding [portable encrypted storage](https://spritely.institute/static/papers/
 Consider a distributed system where peers exchange and request information.
 They interact by exchanging [capabilities](https://garbados.github.io/my-blog/conceptual-intro-to-spritely-goblins.html).
 The DSM requires a few capabilities, which have expected parameters and outputs.
-Specifically: the ability to encode content, and the ability to store blocks.
+Specifically, four:
 
-When a user saves content, the *content provider* chunks it into blocks
-and then encrypts them with a *convergence key*. This key is used to perform
+- The encoder: encodes content into blocks.
+- The writer: persists blocks with a content-addressed identifier.
+- The reader: fetches blocks with that identifier.
+- The decoder: decodes blocks into content.
+
+Content, in this case, is anything that can be [syrup-encoded](https://github.com/ocapn/syrup);
+that is, most of the [primitives](https://github.com/ocapn/syrup#pseudo-specification)
+that you already use.
+
+When a user saves some immutable content, the *encoder* chunks it into blocks
+and encrypts them with a *convergence key*. This key is used to perform
 [convergent encryption](https://en.wikipedia.org/wiki/Convergent_encryption),
-so that the same content with the same key will always encode to the same blocks.
+so the same content with the same key will always encode to the same blocks.
+This is important for deduplication:
+if multiple parties try saving the same information,
+it should only be stored once.
+Furthermore,
+the parties storing data should not need to know what they are storing.
+
 This encoding process follows the [ERIS](https://eris.codeberg.page/) specification.
 
-The blocks produced by the content provider
-are then sent to the *storage provider*,
+The blocks produced by the encoder
+are then sent to the writer,
 who persists them somehow.
 Because the content is chunked,
 and each chunk is encrypted,
-the storage provider cannot know what they are storing,
+the writer cannot know what they are storing,
 so they cannot snoop on user content
 even as they hold it.
 
@@ -47,9 +62,9 @@ This URN can be interpreted to obtain the content:
 ;;> "hello world"
 ```
 
-This URN contains the convergence key and the reference
-of the root block in the tree of blocks composing the content.
-Thus, it should be treated as a sort of password:
+This URN contains the information needed to find
+the root block in the tree of blocks composing the content.
+Thus, it should be treated as a sort of password or address:
 if you have the readcap, you know how to find the content.
 
 When you save content, you are granted a lease on it.
@@ -67,14 +82,24 @@ or for any reason at all.
 The uptime of blocks is up to
 the collective availability of an arbitrary *mesh* of block providers.
 
-Consider a *proxy block provider* which syndicates reads and writes
-to other block providers.
-This proxy block provider can distribute read requests across providers
+Consider a *proxy actor* which syndicates commands to other actors.
+A proxy reader can distribute read requests across providers
 and then return the first that responds (or the second that agrees, etc).
-It can distribute writes across providers too,
+It can distribute writes too,
 considering a write a "success" even if some providers failed to save.
 This provides significant redundancy and parallelism,
-while protecting users and storage providers alike.
+akin to the service maps of production clustered databases.
+
+The division of these roles reflect the dynamism of the trust they require:
+you may have the right to read blocks, but not save them;
+you may be able to interpret readcaps, but not save content.
+The division of these capabilities reflects who is *doing the work*:
+the machine serving blocks is expected to persist them somehow,
+the machine reading blocks is expected to seek them out;
+in turn those machines' owners have the right to only share
+the right to call upon this capability
+with those they trust sufficiently.
+(Of course, this trust can always be [revoked](https://spritely.institute/static/papers/spritely-core.html#revocation-accountability).)
 
 ## Install
 
@@ -84,18 +109,20 @@ You can build the project from source with [guix](https://guix.gnu.org/):
 $ git clone https://github.com/garbados/distributed-storage-mesh.git
 $ cd distributed-storage-mesh
 # run the test suite
-$ guix shell -m manifest.scm -- guile -l dsm.scm tests.scm
+$ ./run-tests.sh
 ```
 
 You can also load the library to require in other files:
 
 ``` shell
-$ guile -l dsm.scm your-file.scm
+# TODO this deserves a better story
+$ guile -l utils.scm -l dsm.scm your-file.scm
 ```
 
 Then you can use the library and its functions:
 
 ``` scheme
+;; TODO this is outdated
 (use-modules ((goblins)
               #:select (spawn-vat define-vat-run $))
              ((dsm)
@@ -116,6 +143,8 @@ Then you can use the library and its functions:
 ```
 
 ## Usage
+
+TODO this is outdated
 
 ### spawn-block-provider
 
